@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# PC上に存在するAIエージェントのハーネス（CLI）を検出し、各ハーネス自身の更新コマンドで一括更新する。
+#
+#   ai-update               更新対象のうちPATH上にあるものをすべて更新する
+#   ai-update codex grok    指定したハーネスだけ更新する
+#   ai-update --list        更新対象と現在のバージョンを表示する（更新しない）
+#   ai-update --discover    PC上にあるが更新対象に入っていないエージェントを表示する（更新しない）
+#   ai-update --add         --discover で見つかったエージェントを対話で更新対象に加える
+#
+# 更新は1つずつ順番に行う（対話プロンプトや出力が混ざらないようにするため）。
+# 1つが失敗しても残りの更新は続け、最後に失敗したものを一覧表示して終了コード1で終わる。
+#
+# macOS 標準の bash 3.2 でも動くよう、連想配列・mapfile 等の bash 4 以降の機能は使わない。
+# また bash 4.4 未満は set -u 下で空配列の "${a[@]}" をエラーにするため、空になりうる配列は
+# ${a[@]+"${a[@]}"} の形で展開する。bash 3.2 は $var の直後の全角文字を変数名の一部として
+# 読むため、全角文字が続く変数は ${var} と書く。
+set -uo pipefail
+
+# シンボリックリンクをたどって実体のパスを返す（macOS の古い readlink は -f を持たないため自前で解決）
+resolve_path() {
+  local path=$1 link
+  while [[ -L $path ]]; do
+    link=$(readlink "$path")
+    [[ $link == /* ]] && path=$link || path=$(dirname "$path")/$link
+  done
+  printf '%s\n' "$path"
+}
+
+# 対応表と除外リストは、シンボリックリンクを解決した実体と同じディレクトリに置く
+ROOT=$(cd "$(dirname "$(resolve_path "$0")")" && pwd)
+HARNESSES=$ROOT/harnesses.tsv
+IGNORED=$ROOT/ignored.txt
+AGENTS_TS_URL=https://raw.githubusercontent.com/vercel-labs/skills/main/src/agents.ts
+BOLD=$'\e[1m'
+RESET=$'\e[0m'
+
+die() { printf 'ai-update: %s\n' "$*" >&2; exit 2; }
+
+# バージョン表示の1行目を返す
+version_of() { "$1" --version 2>&1 | head -n 1; }
+
+has_command() { command -v "$1" >/dev/null 2>&1; }
+
+# 第1引数が残りの引数のいずれかと一致すれば真
+contains() {
+  local needle=$1 item
+  shift
+  for item in "$@"; do
+    [[ $item == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# harnesses.tsv を読み込む。同じ添字で ORDER（コマンド名・更新順）/ AGENTS / ARGS の各列を持つ。
+ORDER=()
+AGENTS=()
+ARGS=()
+load_harnesses() {
+  [[ -f $HARNESSES ]] || die "対応表が見つかりません: $HARNESSES"
+  local cmd agent args
+  while IFS=$'\t' read -r cmd agent args; do
+    [[ -z $cmd || $cmd == \#* ]] && continue
+    [[ -n $agent && -n $args ]] \
+      || die "対応表の形式が不正です（タブ区切りで3列が必要）: $HARNESSES の「${cmd}」の行"
+    ORDER+=("$cmd")
+    AGENTS+=("$agent")
+    ARGS+=("$args")
+  done < "$HARNESSES"
+}
+
+# コマンド名に対応する更新引数を返す。未登録なら偽
+update_args_of() {
+  local i
+  for i in ${ORDER[@]+"${!ORDER[@]}"}; do
+    if [[ ${ORDER[$i]} == "$1" ]]; then
+      printf '%s\n' "${ARGS[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# vercel-labs/skills のエージェント定義（agents.ts）を取得してNodeで実行し、各エージェントの
+# 検出処理（設定ディレクトリの有無）で見つかったもののうち、対応表にも除外リストにも無いものを
+# CANDIDATES に「エージェント名<TAB>表示名」で入れる。
+CANDIDATES=()
+TMP_DIR=
+find_candidates() {
+  has_command node || die "node が必要です"
+  TMP_DIR=$(mktemp -d) || die "一時ディレクトリを作成できません"
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  mkdir "$TMP_DIR/src"
+  curl -fsSL "$AGENTS_TS_URL" -o "$TMP_DIR/agents.orig.ts" \
+    || die "agents.ts を取得できません: $AGENTS_TS_URL"
+  # agents.ts が使う外部パッケージは xdg-basedir だけなので、同じ値（XDG_CONFIG_HOME）に置き換えて
+  # npm install なしで実行できるようにする。.ts は Node 自身の型除去機能で読み込む。
+  local xdg_import="import { xdgConfig } from 'xdg-basedir';"
+  grep -qxF "$xdg_import" "$TMP_DIR/agents.orig.ts" \
+    || die "agents.ts の import 構成が変わったため実行できません（xdg-basedir の import 行が見つかりません）"
+  sed "s|^${xdg_import}\$|const xdgConfig = process.env.XDG_CONFIG_HOME;|" \
+    "$TMP_DIR/agents.orig.ts" > "$TMP_DIR/src/agents.ts"
+  printf '{"type":"module"}\n' > "$TMP_DIR/package.json"
+
+  local detected
+  detected=$(cd / && node --input-type=module -e '
+const { agents } = await import(process.argv[1]);
+for (const a of Object.values(agents)) {
+  if (await a.detectInstalled()) console.log(a.name + "\t" + a.displayName);
+}' "file://$TMP_DIR/src/agents.ts") || die "agents.ts の実行に失敗しました"
+
+  local skip=() line
+  skip=(${AGENTS[@]+"${AGENTS[@]}"})
+  if [[ -f $IGNORED ]]; then
+    while IFS= read -r line; do
+      [[ -z $line || $line == \#* ]] || skip+=("$line")
+    done < "$IGNORED"
+  fi
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    contains "${line%%$'\t'*}" ${skip[@]+"${skip[@]}"} || CANDIDATES+=("$line")
+  done <<< "$detected"
+}
+
+discover() {
+  find_candidates
+  if (( ${#CANDIDATES[@]} == 0 )); then
+    echo "更新対象に入っていないエージェントは見つかりませんでした"
+    return
+  fi
+  echo "PC上にあるが更新対象に入っていないエージェント（設定ディレクトリの有無で判定。IDEや削除済みのものも含む）:"
+  local line
+  for line in "${CANDIDATES[@]}"; do
+    printf '  %-16s %s\n' "${line%%$'\t'*}" "${line#*$'\t'}"
+  done
+  printf '\n更新対象に加えるには ai-update --add を実行してください\n'
+}
+
+# 1件のエージェントについて、実行コマンド名と更新引数を対話で決めて harnesses.tsv に追記する
+add_one() {
+  local agent=$1 cmd args guess=
+  while true; do
+    read -r -p "実行コマンド名（PATH上の名前。空欄でスキップ）: " cmd
+    if [[ -z $cmd ]]; then
+      echo "スキップしました"
+      return
+    elif update_args_of "$cmd" >/dev/null; then
+      echo "$cmd は既に更新対象に入っています"
+    elif ! has_command "$cmd"; then
+      echo "$cmd がPATH上に見つかりません"
+    else
+      break
+    fi
+  done
+
+  # 更新サブコマンドの候補を --help から探して提示する（標準入力を閉じて、対話の起動を防ぐ）
+  local hits=() line
+  while IFS= read -r line; do
+    hits+=("$line")
+  done < <("$cmd" --help </dev/null 2>&1 | grep -iE '^[[:space:]]*(update|upgrade)([[:space:]|,]|$)')
+  if (( ${#hits[@]} > 0 )); then
+    echo "$cmd --help の該当行:"
+    printf '  %s\n' "${hits[@]}"
+    guess=${hits[0]#"${hits[0]%%[![:space:]]*}"}
+    guess=${guess%%[[:space:]|,]*}
+  else
+    echo "$cmd --help に update / upgrade サブコマンドが見つかりません。"
+    echo "ai-update は「$cmd <引数>」を実行して更新するため、自分で更新する機能を持たないCLIは扱えません。"
+  fi
+
+  echo "確認プロンプトを出すCLIなら、止まらないよう -y 等のオプションも含めてください。"
+  read -r -p "更新コマンドの引数${guess:+（Enterで「${guess}」）}。空欄でスキップ: " args
+  args=${args:-$guess}
+  if [[ -z $args ]]; then
+    echo "スキップしました"
+    return
+  fi
+
+  printf '%s\t%s\t%s\n' "$cmd" "$agent" "$args" >> "$HARNESSES"
+  ORDER+=("$cmd")
+  AGENTS+=("$agent")
+  ARGS+=("$args")
+  echo "追加しました: 更新時に「$cmd ${args}」を実行します"
+}
+
+add_interactive() {
+  [[ -t 0 && -t 1 ]] || die "--add は対話端末で実行してください"
+  find_candidates
+  if (( ${#CANDIDATES[@]} == 0 )); then
+    echo "追加できるエージェントは見つかりませんでした"
+    return
+  fi
+  local line agent ans
+  for line in "${CANDIDATES[@]}"; do
+    agent=${line%%$'\t'*}
+    printf '\n%s==> %s%s (%s)\n' "$BOLD" "${line#*$'\t'}" "$RESET" "$agent"
+    while true; do
+      read -r -p "更新対象に加えますか？ [a=加える / s=今回はスキップ / i=今後表示しない]: " ans
+      case $ans in
+        a) add_one "$agent"; break ;;
+        s) echo "スキップしました"; break ;;
+        i) printf '%s\n' "$agent" >> "$IGNORED"
+           echo "今後表示しません（$IGNORED に記録しました）"; break ;;
+        *) echo "a / s / i のいずれかを入力してください" ;;
+      esac
+    done
+  done
+}
+
+load_harnesses
+
+list_mode=0
+targets=()
+for arg in "$@"; do
+  case $arg in
+    --list|-l) list_mode=1 ;;
+    --discover) discover; exit 0 ;;
+    --add) add_interactive; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "不明なオプション: $arg" ;;
+    *) update_args_of "$arg" >/dev/null \
+         || die "更新対象に入っていないハーネス: ${arg}（対象: ${ORDER[*]-}）"
+       targets+=("$arg") ;;
+  esac
+done
+
+if (( list_mode )); then
+  for name in ${ORDER[@]+"${ORDER[@]}"}; do
+    if has_command "$name"; then
+      printf '%-13s %s\n' "$name" "$(version_of "$name")"
+    else
+      printf '%-13s %s\n' "$name" '(未インストール)'
+    fi
+  done
+  exit 0
+fi
+
+# 対象未指定なら、更新対象のうちPATH上に存在するものをすべて対象にする
+if (( ${#targets[@]} == 0 )); then
+  for name in ${ORDER[@]+"${ORDER[@]}"}; do
+    has_command "$name" && targets+=("$name")
+  done
+  (( ${#targets[@]} > 0 )) || die "更新対象のハーネスが1つも見つかりません"
+else
+  for name in "${targets[@]}"; do
+    has_command "$name" || die "$name がPATH上に見つかりません"
+  done
+fi
+
+failed=()
+summary=()
+for name in "${targets[@]}"; do
+  read -r -a argv <<< "$(update_args_of "$name")"
+  before=$(version_of "$name")
+  printf '\n%s==> %s%s  (%s)\n' "$BOLD" "$name" "$RESET" "$before"
+  if "$name" "${argv[@]}"; then
+    after=$(version_of "$name")
+    if [[ $before == "$after" ]]; then
+      summary+=("$(printf '%-13s 変更なし  %s' "$name" "$after")")
+    else
+      summary+=("$(printf '%-13s 更新      %s -> %s' "$name" "$before" "$after")")
+    fi
+  else
+    failed+=("$name")
+    summary+=("$(printf '%-13s 失敗' "$name")")
+  fi
+done
+
+printf '\n%s==> 結果%s\n' "$BOLD" "$RESET"
+printf '%s\n' "${summary[@]}"
+if (( ${#failed[@]} > 0 )); then
+  printf '\n失敗: %s（上の出力を確認してください）\n' "${failed[*]}" >&2
+  exit 1
+fi

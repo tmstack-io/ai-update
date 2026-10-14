@@ -1,0 +1,10 @@
+# ai-update の更新対象。1行1ハーネス、タブ区切りで3列:
+#   コマンド名	vercel-labs/skills のエージェント名（無ければ -）	更新コマンドの引数
+# 上から順に更新する。ai-update --add で対話的に追記できる。
+claude	claude-code	update
+codex	codex	update
+grok	grok	update
+agy	antigravity-cli	update
+hermes	hermes-agent	update --yes
+cursor-agent	cursor	update
+kiro-cli	kiro-cli	update --non-interactive

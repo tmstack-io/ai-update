@@ -1,0 +1,2 @@
+# ai-update --discover / --add で表示しない vercel-labs/skills のエージェント名（1行1件）。
+# ai-update --add で「今後表示しない」を選ぶと追記される。
